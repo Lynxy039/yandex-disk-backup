@@ -24,11 +24,17 @@ jobs:
           python-version: "3.13"
       - name: Install rclone (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y rclone
+        run: |
+          curl --fail --location https://downloads.rclone.org/v1.75.1/rclone-v1.75.1-linux-amd64.zip --output rclone.zip
+          unzip -q rclone.zip
+          sudo install -m 755 rclone-v1.75.1-linux-amd64/rclone /usr/local/bin/rclone
       - name: Install rclone (Windows)
         if: runner.os == 'Windows'
         run: choco install rclone -y --no-progress
       - name: Install Python dependencies
         run: python -m pip install -r requirements.txt
+      - name: Smoke-test Windows launcher
+        if: runner.os == 'Windows'
+        run: .\get-from-yadisk.cmd --help
       - name: Run tests
         run: python -m unittest -v
