@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 import transfers
+import passwords
 from discovery import Inventory, stream_source as list_source
 
 
@@ -219,17 +220,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", nargs="?", default=str(Path(__file__).with_name("settings.json")))
     parser.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--password-stdin", action="store_true", help=argparse.SUPPRESS)
+    encryption = parser.add_mutually_exclusive_group()
+    encryption.add_argument("--encrypt-password", action="store_true", help="Зашифровать пароль приложения мастер-паролем без запуска выгрузки")
+    encryption.add_argument("--decrypt-password", action="store_true", help="Отключить шифрование и сохранить пароль открытым текстом без запуска выгрузки")
     args = parser.parse_args()
     config_path = Path(args.config).expanduser().resolve()
     observer = (lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)) if args.events else None
     os.umask(0o077)
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("Ожидался JSON-объект настроек")
+        if os.name != "nt" and config_path.stat().st_mode & 0o077:
+            raise ValueError(f"Закройте доступ к паролю: chmod 600 '{config_path}'")
+        if args.encrypt_password or args.decrypt_password:
+            passwords.configure_encryption(config_path, config, enabled=args.encrypt_password)
+            print("Шифрование включено" if args.encrypt_password else "Шифрование отключено: пароль хранится открытым текстом")
+            return 0
+        if "app_password_encrypted" in config or args.password_stdin:
+            config["app_password"] = passwords.read_password(config, from_stdin=args.password_stdin)
         logs = validate(config, config_path.parent)
         if not shutil.which("rclone"):
             raise ValueError("Установите rclone: brew install rclone (macOS) или sudo apt install rclone (Ubuntu)")
-        if os.name != "nt" and config_path.stat().st_mode & 0o077:
-            raise ValueError(f"Закройте доступ к паролю: chmod 600 '{config_path}'")
         # Пароль не передаётся аргументом процесса и не сохраняется в rclone.conf.
         obscured = subprocess.run(["rclone", "obscure", "-"], input=config["app_password"],
                                   text=True, capture_output=True, check=True).stdout.strip()
@@ -271,7 +284,9 @@ def main():
             return 0 if status == "ok" else (130 if status == "interrupted" else 1)
         finally:
             lock.unlink()
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    except KeyboardInterrupt:
+        return 130
+    except (EOFError, OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 1
 

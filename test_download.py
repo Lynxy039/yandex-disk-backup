@@ -138,6 +138,52 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(result["cached_files"], 0)
             self.assertEqual(result["files"], 0)
 
+    def test_cli_encryption_flags_only_change_credentials_not_start_download(self):
+        import contextlib
+        import io
+        import passwords
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = root / "settings.json"
+            config = {"login": "user", "app_password": "app-secret", "jobs": [
+                {"source": "/Фото", "destination": str(root / "backup")}]}
+            passwords.save_config(settings, config)
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["download.py", str(settings), "--encrypt-password"]), \
+                 patch("passwords.prompt_master", side_effect=["случайные слова для защиты"] * 2), \
+                 patch.object(download, "run_job") as run_job, contextlib.redirect_stdout(output):
+                self.assertEqual(download.main(), 0)
+                run_job.assert_not_called()
+            self.assertNotIn("app_password", json.loads(settings.read_text()))
+            with patch.object(sys, "argv", ["download.py", str(settings), "--decrypt-password"]), \
+                 patch("passwords.prompt_master", return_value="случайные слова для защиты"), \
+                 patch.object(download, "run_job") as run_job, contextlib.redirect_stdout(output):
+                self.assertEqual(download.main(), 0)
+                run_job.assert_not_called()
+            self.assertEqual(json.loads(settings.read_text()), config)
+            self.assertFalse((root / "logs").exists())
+            self.assertNotIn("app-secret", output.getvalue())
+            self.assertNotIn("случайные слова", output.getvalue())
+
+    def test_main_unlocks_encrypted_settings_without_writing_plaintext(self):
+        import passwords
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = root / "settings.json"
+            config = {"login": "user", "app_password_encrypted": passwords.encrypt_password("app-secret", "случайные слова для защиты"),
+                      "jobs": [{"source": "/Фото", "destination": str(root / "backup")}]}
+            settings.write_text(json.dumps(config))
+            settings.chmod(0o600)
+            original = settings.read_bytes()
+            with patch.object(sys, "argv", ["download.py", str(settings)]), \
+                 patch("passwords.prompt_master", return_value="случайные слова для защиты"), \
+                 patch.object(download, "list_source", return_value=records()):
+                self.assertEqual(download.main(), 0)
+            self.assertEqual(settings.read_bytes(), original)
+            for report in (root / "logs").rglob("*.json*"):
+                self.assertNotIn("app-secret", report.read_text())
+                self.assertNotIn("случайные слова", report.read_text())
+
     def test_main_continues_after_failed_job_without_logging_password(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from textual.widgets import Input, Static
+from textual.widgets import Checkbox, Input, Static
 
 from tui import YandexApp, JobRow, LogTail
 
@@ -42,6 +42,40 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("low_level_retries", saved)
                 if os.name != "nt":
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    async def test_enables_encryption_and_can_disable_after_unlock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            app = YandexApp(path)
+            async with app.run_test(size=(120, 45)):
+                app.query_one("#login", Input).value = "user"
+                app.query_one("#password", Input).value = "app-secret"
+                app.query_one(JobRow).query_one(".destination", Input).value = str(Path(tmp) / "backup")
+                app.query_one("#encrypt-password", Checkbox).value = True
+                app.query_one("#master-password", Input).value = "случайные слова для защиты"
+                app.query_one("#master-confirm", Input).value = "не совпадает"
+                self.assertFalse(app.save_settings())
+                self.assertFalse(path.exists())
+                app.query_one("#master-confirm", Input).value = "случайные слова для защиты"
+                self.assertTrue(app.save_settings())
+                saved = json.loads(path.read_text())
+                self.assertNotIn("app_password", saved)
+                self.assertIn("app_password_encrypted", saved)
+                self.assertNotIn("app-secret", path.read_text())
+                self.assertNotIn("случайные слова", path.read_text())
+            original = path.read_bytes()
+            reopened = YandexApp(path)
+            async with reopened.run_test(size=(120, 45)):
+                self.assertEqual(reopened.query_one("#password", Input).value, "")
+                reopened.query_one("#encrypt-password", Checkbox).value = False
+                reopened.query_one("#master-password", Input).value = "неверный мастер-пароль"
+                self.assertFalse(reopened.save_settings())
+                self.assertEqual(path.read_bytes(), original)
+                reopened.query_one("#master-password", Input).value = "случайные слова для защиты"
+                self.assertTrue(reopened.save_settings())
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved["app_password"], "app-secret")
+                self.assertNotIn("app_password_encrypted", saved)
 
     async def test_rejects_bad_settings_without_starting(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,6 +132,38 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("проверено", str(app.query_one("#run-status", Static).render()))
                     self.assertEqual(app.exit_code, 0)
                     self.assertTrue(list((root / "logs").glob("*/01/downloaded.jsonl")))
+
+    async def test_encrypted_settings_launch_real_backend_through_private_pipe(self):
+        import passwords
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "Фото.jpg").write_bytes(b"photo")
+            config = root / "settings.json"
+            passwords.save_config(config, {"login": "user", "app_password_encrypted":
+                passwords.encrypt_password("app-secret", "случайные слова для защиты"), "jobs": [
+                {"source": "/Фото", "destination": str(root / "backup")}]})
+            original = asyncio.create_subprocess_exec
+            async def launch(python, *args, **kwargs):
+                self.assertIn("--password-stdin", args)
+                self.assertNotIn("app-secret", str(args))
+                self.assertNotIn("случайные слова", str(args))
+                self.assertEqual(kwargs["stdin"], asyncio.subprocess.PIPE)
+                code = f"import download; download.remote_source=lambda _: {str(source)!r}; raise SystemExit(download.main())"
+                return await original(python, "-u", "-c", code, str(config), "--events", "--password-stdin", **kwargs)
+            app = YandexApp(config)
+            with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
+                async with app.run_test(size=(100, 32)) as pilot:
+                    app.query_one("#master-password", Input).value = "случайные слова для защиты"
+                    await pilot.press("f5")
+                    await wait_until(pilot, lambda: app.final_event and not app.running)
+                    self.assertEqual((root / "backup/Фото.jpg").read_bytes(), b"photo")
+                    self.assertEqual(app.exit_code, 0)
+                    self.assertNotIn("app_password", json.loads(config.read_text()))
+                    self.assertNotIn("app-secret", config.read_text())
+                    app.append_log("app-secret случайные слова для защиты")
+                    self.assertEqual(app.query_one("#run-log").lines[-1].text, "*** ***")
 
     async def test_partial_discovery_still_downloads_and_shows_incomplete_status(self):
         with tempfile.TemporaryDirectory() as tmp:

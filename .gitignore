@@ -15,6 +15,6 @@ download.log
 __pycache__/
 *.pyc
 .venv/
-*.tui.tmp
+*.tmp
 .DS_Store
 ._*

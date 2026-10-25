@@ -15,10 +15,11 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import (Button, Collapsible, DataTable, Footer, Header, Input,
+from textual.widgets import (Button, Checkbox, Collapsible, DataTable, Footer, Header, Input,
                              Label, ProgressBar, RichLog, Static, TabbedContent, TabPane)
 
 import download
+import passwords
 
 
 class LogTail:
@@ -135,6 +136,7 @@ class YandexApp(App):
         self.config_path = Path(config_path).expanduser().resolve()
         self.settings = {"login": "", "app_password": "", "logs_dir": "logs", **download.transfers.DEFAULTS,
                          "jobs": [{"source": "/", "destination": ""}]}
+        self.session_password = ""
         self.load_error = ""
         try:
             if self.config_path.exists():
@@ -172,10 +174,21 @@ class YandexApp(App):
                     yield Label("Логин Яндекса")
                     yield Input(str(self.settings["login"]), id="login", placeholder="login@yandex.ru")
                     yield Label("Пароль приложения для Яндекс Диска")
-                    yield Input(str(self.settings["app_password"]), password=True, id="password")
+                    yield Input(str(self.settings.get("app_password", "")), password=True, id="password")
                     yield Static("Создать: https://id.yandex.ru/security/app-passwords\n"
-                                 "Не основной пароль аккаунта. При сохранении пароль записывается в settings.json с правами 600.",
+                                 "Не основной пароль аккаунта. Без шифрования сохраняется открытым текстом (права 600).\n"
+                                 "Если пароль уже зашифрован, оставьте поле выше пустым и введите мастер-пароль ниже.",
                                  classes="hint", id="password-hint", markup=False)
+                    with Collapsible(title="Мастер-пароль (необязательно)", collapsed="app_password_encrypted" not in self.settings):
+                        yield Checkbox("Шифровать пароль мастер-паролем", value="app_password_encrypted" in self.settings,
+                                       id="encrypt-password")
+                        yield Label("Мастер-пароль (не сохраняется; минимум 12 символов, лучше случайные слова)")
+                        yield Input(password=True, id="master-password")
+                        yield Label("Повторите мастер-пароль при включении шифрования или замене пароля Яндекса")
+                        yield Input(password=True, id="master-confirm")
+                        yield Static("Чтобы отключить шифрование, снимите галочку и сохраните с текущим мастер-паролем.\n"
+                                     "Забытый мастер-пароль восстановить нельзя — потребуется новый пароль приложения Яндекса.",
+                                     classes="hint")
                     yield Static("ПАПКИ: НА ДИСКЕ → НА КОМПЬЮТЕРЕ", classes="section")
                     yield Static("Копируется содержимое папки вместе со всеми подпапками. Используйте отдельные папки назначения.",
                                  classes="hint")
@@ -230,7 +243,8 @@ class YandexApp(App):
         self.query_one("#login", Input).focus()
 
     def collect_settings(self):
-        config = {key: value for key, value in self.settings.items() if key not in ("retries", "low_level_retries")}
+        config = {key: value for key, value in self.settings.items()
+                  if key not in ("retries", "low_level_retries", "app_password_encrypted")}
         for key, identifier in (("login", "login"), ("app_password", "password"), ("logs_dir", "logs")):
             config[key] = self.query_one(f"#{identifier}", Input).value
         for key in download.transfers.DEFAULTS:
@@ -241,24 +255,32 @@ class YandexApp(App):
         config["jobs"] = [{"source": row.query_one(".source", Input).value,
                            "destination": row.query_one(".destination", Input).value}
                           for row in self.query(JobRow)]
+        master = self.query_one("#master-password", Input).value
+        replacing = bool(config["app_password"])
+        if not replacing and "app_password_encrypted" in self.settings:
+            config["app_password"] = passwords.decrypt_password(self.settings["app_password_encrypted"], master)
         download.validate(copy.deepcopy(config), self.config_path.parent)
-        return config
+        password = config["app_password"]
+        if self.query_one("#encrypt-password", Checkbox).value:
+            if (replacing or "app_password_encrypted" not in self.settings) and master != self.query_one("#master-confirm", Input).value:
+                raise ValueError("Мастер-пароли не совпадают; настройки не изменены")
+            config["app_password_encrypted"] = passwords.encrypt_password(password, master)
+            del config["app_password"]
+        return config, password
 
     def save_settings(self):
         try:
-            config = self.collect_settings()
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            # Создание нового временного файла с 600, даже если прежний файл был публичным.
-            temporary = self.config_path.with_name(self.config_path.name + ".tui.tmp")
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    json.dump(config, stream, ensure_ascii=False, indent=2)
-                    stream.write("\n")
-                temporary.replace(self.config_path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            config, password = self.collect_settings()
+            passwords.save_config(self.config_path, config)
             self.settings = config
+            self.session_password = password
+            if "app_password_encrypted" in config:
+                self.query_one("#password", Input).value = ""
+                self.query_one("#master-confirm", Input).value = ""
+            else:
+                self.query_one("#password", Input).value = password
+                self.query_one("#master-password", Input).value = ""
+                self.query_one("#master-confirm", Input).value = ""
             self.query_one("#form-message", Static).update(f"Сохранено: {self.config_path}")
             return True
         except (OSError, ValueError, TypeError, KeyError) as error:
@@ -310,17 +332,27 @@ class YandexApp(App):
         self.launch_download()
 
     def set_form_disabled(self, disabled):
-        for widget in self.query("#settings-tab Input, #settings-tab Button"):
+        for widget in self.query("#settings-tab Input, #settings-tab Button, #settings-tab Checkbox"):
             widget.disabled = disabled
         self.query_one("#stop", Button).disabled = not disabled
 
     @work(exclusive=True)
     async def launch_download(self):
         try:
+            encrypted = "app_password_encrypted" in self.settings
             self.process = await asyncio.create_subprocess_exec(
                 sys.executable, "-u", str(Path(__file__).with_name("download.py")),
-                str(self.config_path), "--events", stdout=asyncio.subprocess.PIPE,
+                str(self.config_path), "--events", *(["--password-stdin"] if encrypted else []),
+                stdin=asyncio.subprocess.PIPE if encrypted else None, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+            if encrypted:
+                try:
+                    self.process.stdin.write((json.dumps(self.session_password) + "\n").encode("utf-8"))
+                    await self.process.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # Ошибку старта движка прочитаем из stdout ниже.
+                finally:
+                    self.process.stdin.close()
             if self.stopping:
                 self.process.send_signal(signal.SIGINT)
             while line := await self.process.stdout.readline():
@@ -357,9 +389,10 @@ class YandexApp(App):
                 self.exit(self.exit_code)
 
     def append_log(self, text):
-        password = self.settings.get("app_password", "")
-        if password:
-            text = text.replace(password, "***")
+        for password in (self.session_password, self.settings.get("app_password", ""),
+                         self.query_one("#master-password", Input).value):
+            if password:
+                text = text.replace(password, "***")
         self.query_one("#run-log", RichLog).write(Text(text))
 
     def handle_event(self, event):
