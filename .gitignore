@@ -1,6 +1,7 @@
 settings.json
 settings.*.json
 !settings.example.json
+!settings.rest.example.json
 .yadisk.env
 .env
 .env.*

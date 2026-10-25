@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from textual.widgets import Checkbox, Input, Static
+from textual.widgets import Checkbox, Input, Select, Static
 
 from tui import YandexApp, JobRow, LogTail
 
@@ -121,7 +121,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             config.chmod(0o600)
             original = asyncio.create_subprocess_exec
             async def launch(python, *args, **kwargs):
-                code = f"import download; download.remote_source=lambda _: {str(source)!r}; raise SystemExit(download.main())"
+                code = f"import download; download.remote_source=lambda *args: {str(source)!r}; raise SystemExit(download.main())"
                 return await original(python, "-u", "-c", code, str(config), "--events", **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
@@ -150,7 +150,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("app-secret", str(args))
                 self.assertNotIn("случайные слова", str(args))
                 self.assertEqual(kwargs["stdin"], asyncio.subprocess.PIPE)
-                code = f"import download; download.remote_source=lambda _: {str(source)!r}; raise SystemExit(download.main())"
+                code = f"import download; download.remote_source=lambda *args: {str(source)!r}; raise SystemExit(download.main())"
                 return await original(python, "-u", "-c", code, str(config), "--events", "--password-stdin", **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
@@ -165,6 +165,57 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     app.append_log("app-secret случайные слова для защиты")
                     self.assertEqual(app.query_one("#run-log").lines[-1].text, "*** ***")
 
+    async def test_rest_switch_encrypts_token_and_launches_without_webdav_password(self):
+        import passwords
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "Фото.jpg").write_bytes(b"photo")
+            config = root / "settings.json"
+            passwords.save_config(config, {"login": "user", "app_password": "old-webdav-secret", "jobs": [
+                {"source": "/Фото", "destination": str(root / "backup")}]})
+            original = asyncio.create_subprocess_exec
+            async def launch(python, *args, **kwargs):
+                self.assertIn("--password-stdin", args)
+                self.assertNotIn("test-polygon-token", str(args))
+                code = f"import download; download.remote_source=lambda *args: {str(source)!r}; raise SystemExit(download.main())"
+                return await original(python, "-u", "-c", code, str(config), "--events", "--password-stdin", **kwargs)
+            app = YandexApp(config)
+            with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
+                async with app.run_test(size=(100, 32)) as pilot:
+                    app.query_one("#backend", Select).value = "rest"
+                    await pilot.pause()
+                    self.assertEqual(app.query_one("#password", Input).value, "")
+                    self.assertIn("OAuth", str(app.query_one("#credential-label").render()))
+                    app.query_one("#password", Input).value = "test-polygon-token"
+                    app.query_one("#encrypt-password", Checkbox).value = True
+                    app.query_one("#master-password", Input).value = "несколько случайных слов"
+                    app.query_one("#master-confirm", Input).value = "несколько случайных слов"
+                    await pilot.press("f5")
+                    await wait_until(pilot, lambda: app.final_event and not app.running)
+                    self.assertEqual(app.exit_code, 0)
+                    self.assertEqual((root / "backup/Фото.jpg").read_bytes(), b"photo")
+            saved = json.loads(config.read_text())
+            self.assertEqual(saved["backend"], "rest")
+            self.assertIn("oauth_token_encrypted", saved)
+            self.assertNotIn("oauth_token", saved)
+            self.assertNotIn("app_password", saved)
+            self.assertNotIn("old-webdav-secret", config.read_text())
+            self.assertNotIn("test-polygon-token", config.read_text())
+            reopened = YandexApp(config)
+            async with reopened.run_test(size=(100, 32)) as pilot:
+                self.assertEqual(reopened.query_one("#backend", Select).value, "rest")
+                reopened.query_one("#master-password", Input).value = "несколько случайных слов"
+                reopened.query_one("#encrypt-password", Checkbox).value = False
+                self.assertTrue(reopened.save_settings())
+                self.assertEqual(json.loads(config.read_text())["oauth_token"], "test-polygon-token")
+                reopened.query_one("#backend", Select).value = "webdav"
+                await pilot.pause()
+                self.assertEqual(reopened.query_one("#password", Input).value, "")
+                self.assertFalse(reopened.save_settings())
+                self.assertEqual(json.loads(config.read_text())["backend"], "rest")
+
     async def test_partial_discovery_still_downloads_and_shows_incomplete_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -178,7 +229,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             original = asyncio.create_subprocess_exec
             async def launch(python, *args, **kwargs):
                 code = ("import asyncio,download\nfrom pathlib import Path\n"
-                        f"download.remote_source=lambda _: {str(source)!r}\n"
+                        f"download.remote_source=lambda *args: {str(source)!r}\n"
                         "async def discover(*args):\n"
                         " yield {'Path':'found.jpg','Size':5,'IsDir':False}\n"
                         f" while not Path({str(root / 'backup/found.jpg')!r}).exists(): await asyncio.sleep(.02)\n"

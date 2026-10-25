@@ -1,4 +1,4 @@
-"""Опциональное AES-GCM-шифрование; мастер-пароль и ключ существуют только в памяти."""
+"""AES-GCM-шифрование пароля/токена; мастер-пароль и ключ существуют только в памяти."""
 import base64
 import binascii
 import getpass
@@ -8,7 +8,15 @@ from pathlib import Path
 import sys
 import tempfile
 
-AAD = b"yandex-disk-backup/app-password/v1"
+AAD = b"yandex-disk-backup/app-password/v1"  # Сохраняем совместимость формата зашифрованных настроек.
+
+
+def credential_fields(config):
+    backend = config.get("backend", "webdav")
+    if backend not in ("webdav", "rest"):
+        raise ValueError("backend должен быть webdav или rest")
+    field = "oauth_token" if backend == "rest" else "app_password"
+    return field, field + "_encrypted"
 
 
 def _crypto():
@@ -30,7 +38,7 @@ def encrypt_password(password, master):
     if not isinstance(master, str) or len(master) < 12:
         raise ValueError("Мастер-пароль: не менее 12 символов; лучше несколько случайных слов")
     if not isinstance(password, str) or not password.strip() or len(password.encode("utf-8")) > 16368:
-        raise ValueError("Некорректный пароль приложения")
+        raise ValueError("Некорректный пароль приложения или OAuth-токен")
     aes, scrypt, _ = _crypto()
     salt, nonce = os.urandom(16), os.urandom(12)
     ciphertext = aes(_key(master, salt, scrypt)).encrypt(nonce, password.encode("utf-8"), AAD)
@@ -67,24 +75,25 @@ def prompt_master(label="Мастер-пароль: "):
 
 
 def read_password(config, from_stdin=False):
-    if "app_password_encrypted" in config:
+    field, encrypted_field = credential_fields(config)
+    if encrypted_field in config:
         if from_stdin:
-            # TUI передаёт только пароль приложения по отдельному pipe, не мастер-пароль и не аргументы.
+            # TUI передаёт только пароль/токен по отдельному pipe, не мастер-пароль и не аргументы.
             try:
                 line = sys.stdin.readline(65536)
                 if len(line) >= 65536:
                     raise ValueError
                 password = json.loads(line)
             except ValueError:
-                raise ValueError("Не получен пароль приложения от TUI") from None
+                raise ValueError("Не получен пароль или токен от TUI") from None
         else:
-            password = decrypt_password(config["app_password_encrypted"], prompt_master())
+            password = decrypt_password(config[encrypted_field], prompt_master())
     else:
         if from_stdin:
-            raise ValueError("Передача пароля из TUI ожидает зашифрованные настройки")
-        password = config.get("app_password", "")
+            raise ValueError("Передача пароля/токена из TUI ожидает зашифрованные настройки")
+        password = config.get(field, "")
     if not isinstance(password, str) or not password.strip():
-        raise ValueError("Заполните пароль приложения в настройках")
+        raise ValueError(f"Заполните {field} в настройках")
     return password
 
 
@@ -103,15 +112,16 @@ def save_config(path, config):
 
 
 def configure_encryption(path, config, enabled):
+    field, encrypted_field = credential_fields(config)
     password = read_password(config)
     updated = dict(config)
-    updated.pop("app_password", None)
-    updated.pop("app_password_encrypted", None)
+    updated.pop(field, None)
+    updated.pop(encrypted_field, None)
     if enabled:
         master = prompt_master("Новый мастер-пароль (не менее 12 символов): ")
         if master != prompt_master("Повторите новый мастер-пароль: "):
             raise ValueError("Мастер-пароли не совпадают; настройки не изменены")
-        updated["app_password_encrypted"] = encrypt_password(password, master)
+        updated[encrypted_field] = encrypt_password(password, master)
     else:
-        updated["app_password"] = password
+        updated[field] = password
     save_config(path, updated)

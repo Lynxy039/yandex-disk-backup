@@ -1,0 +1,17 @@
+{
+  "backend": "rest",
+  "login": "ВАШ_ЛОГИН_ЯНДЕКСА",
+  "oauth_token": "ВСТАВЬТЕ_ТОКЕН_ПОЛИГОНА_ЯНДЕКСА",
+  "jobs": [
+    {
+      "source": "/Фотографии",
+      "destination": "~/Pictures/YandexBackup/Фотографии"
+    }
+  ],
+  "logs_dir": "logs",
+  "transfers": 16,
+  "idle_timeout": 8,
+  "file_timeout": 60,
+  "retry_passes": 2,
+  "listing_timeout": 180
+}

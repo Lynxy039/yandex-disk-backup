@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Выгрузка выбранных папок Яндекс Диска через rclone/WebDAV."""
+"""Выгрузка выбранных папок Яндекс Диска через rclone: WebDAV или REST API."""
 import argparse
 import asyncio
 from datetime import datetime
@@ -24,9 +24,12 @@ def save_json(path, data):
 
 
 def validate(config, base):
-    for key in ("login", "app_password"):
+    credential, _ = passwords.credential_fields(config)
+    for key in ("login", credential):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise ValueError(f"Заполните {key} в настройках")
+    if config.get("backend", "webdav") == "rest" and any(char.isspace() for char in config[credential]):
+        raise ValueError("Токен Полигона должен быть одной строкой без пробелов")
     jobs = config.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("jobs должен содержать хотя бы одну папку")
@@ -58,8 +61,23 @@ def validate(config, base):
     return logs
 
 
-def remote_source(source):
-    return ":webdav:" + source.rstrip("/") + "/"
+def remote_source(source, backend="webdav"):
+    remote = "yandex" if backend == "rest" else "webdav"
+    return f":{remote}:" + source.rstrip("/") + "/"
+
+
+def rclone_environment(config):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("RCLONE_")}
+    if config.get("backend", "webdav") == "rest":
+        # У токена Полигона нет refresh_token. Заглушка и будущая expiry отключают попытку обновления.
+        env["RCLONE_YANDEX_TOKEN"] = json.dumps({"access_token": config["oauth_token"], "token_type": "OAuth",
+                                               "refresh_token": "unused", "expiry": "2099-01-01T00:00:00Z"})
+    else:
+        obscured = subprocess.run(["rclone", "obscure", "-"], input=config["app_password"],
+                                  text=True, capture_output=True, check=True).stdout.strip()
+        env.update(RCLONE_WEBDAV_URL="https://webdav.yandex.ru/", RCLONE_WEBDAV_VENDOR="other",
+                   RCLONE_WEBDAV_USER=config["login"], RCLONE_WEBDAV_PASS=obscured)
+    return env
 
 
 def write_reports(entries, root, folder, interrupted):
@@ -98,7 +116,7 @@ def write_reports(entries, root, folder, interrupted):
 def run_job(job, folder, config, env, observer=None):
     folder.mkdir(parents=True, exist_ok=False)
     root = Path(job["destination"])
-    result = {"source": job["source"], "destination": str(root), "status": "running",
+    result = {"source": job["source"], "destination": str(root), "backend": config.get("backend", "webdav"), "status": "running",
               "manifest_complete": False, "verification_complete": False}
     entries, directories = [], set()
     inventory = None
@@ -139,9 +157,12 @@ def run_job(job, folder, config, env, observer=None):
         print(f"\n{job['source']} → {root}\nОтчёты: {folder}", flush=True)
     try:
         root.mkdir(parents=True, exist_ok=True)
-        source = remote_source(job["source"])
+        source = remote_source(job["source"], config.get("backend", "webdav"))
         phase("copy", "copy.jsonl")
-        identity = json.dumps([config.get("login", ""), job["source"], str(root.resolve())], ensure_ascii=False)
+        identity_parts = [config.get("login", ""), job["source"], str(root.resolve())]
+        if config.get("backend", "webdav") == "rest":
+            identity_parts.append("rest")  # Не смешиваем индекс WebDAV с ещё не проверенным REST-аккаунтом.
+        identity = json.dumps(identity_parts, ensure_ascii=False)
         key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         cache_dir = Path(config.get("_cache_dir", folder.parent / ".inventory"))
         inventory = Inventory(cache_dir / f"{key}.sqlite3")
@@ -222,8 +243,8 @@ def main():
     parser.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--password-stdin", action="store_true", help=argparse.SUPPRESS)
     encryption = parser.add_mutually_exclusive_group()
-    encryption.add_argument("--encrypt-password", action="store_true", help="Зашифровать пароль приложения мастер-паролем без запуска выгрузки")
-    encryption.add_argument("--decrypt-password", action="store_true", help="Отключить шифрование и сохранить пароль открытым текстом без запуска выгрузки")
+    encryption.add_argument("--encrypt-password", action="store_true", help="Зашифровать пароль/токен мастер-паролем без запуска выгрузки")
+    encryption.add_argument("--decrypt-password", action="store_true", help="Отключить шифрование пароля/токена без запуска выгрузки")
     args = parser.parse_args()
     config_path = Path(args.config).expanduser().resolve()
     observer = (lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)) if args.events else None
@@ -236,19 +257,16 @@ def main():
             raise ValueError(f"Закройте доступ к паролю: chmod 600 '{config_path}'")
         if args.encrypt_password or args.decrypt_password:
             passwords.configure_encryption(config_path, config, enabled=args.encrypt_password)
-            print("Шифрование включено" if args.encrypt_password else "Шифрование отключено: пароль хранится открытым текстом")
+            print("Шифрование включено" if args.encrypt_password else "Шифрование отключено: пароль/токен хранится открытым текстом")
             return 0
-        if "app_password_encrypted" in config or args.password_stdin:
-            config["app_password"] = passwords.read_password(config, from_stdin=args.password_stdin)
+        credential, encrypted_field = passwords.credential_fields(config)
+        if encrypted_field in config or args.password_stdin:
+            config[credential] = passwords.read_password(config, from_stdin=args.password_stdin)
         logs = validate(config, config_path.parent)
         if not shutil.which("rclone"):
             raise ValueError("Установите rclone: brew install rclone (macOS) или sudo apt install rclone (Ubuntu)")
-        # Пароль не передаётся аргументом процесса и не сохраняется в rclone.conf.
-        obscured = subprocess.run(["rclone", "obscure", "-"], input=config["app_password"],
-                                  text=True, capture_output=True, check=True).stdout.strip()
-        env = {key: value for key, value in os.environ.items() if not key.startswith("RCLONE_")}
-        env.update(RCLONE_WEBDAV_URL="https://webdav.yandex.ru/", RCLONE_WEBDAV_VENDOR="other",
-                   RCLONE_WEBDAV_USER=config["login"], RCLONE_WEBDAV_PASS=obscured)
+        # Учётные данные — только через окружение, без аргументов процесса и rclone.conf.
+        env = rclone_environment(config)
         logs.mkdir(parents=True, exist_ok=True)
         config["_cache_dir"] = str(logs / ".inventory")
         lock = logs / ".download.lock"

@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (Button, Checkbox, Collapsible, DataTable, Footer, Header, Input,
-                             Label, ProgressBar, RichLog, Static, TabbedContent, TabPane)
+                             Label, ProgressBar, RichLog, Select, Static, TabbedContent, TabPane)
 
 import download
 import passwords
@@ -86,6 +86,16 @@ class ConfirmQuit(ModalScreen):
         self.dismiss(event.button.id == "quit-now")
 
 
+def credential_description(backend):
+    if backend == "rest":
+        label = "OAuth-токен Полигона Яндекс Диска"
+        hint = "Получить: https://yandex.ru/dev/disk/poligon/\nТокен того же аккаунта, что указан в логине. Не токен из обычного rclone config."
+    else:
+        label = "Пароль приложения для Яндекс Диска"
+        hint = "Создать: https://id.yandex.ru/security/app-passwords\nНе основной пароль аккаунта."
+    return label, hint + "\nБез шифрования сохраняется открытым текстом (600). Если секрет зашифрован, оставьте поле пустым и введите мастер-пароль."
+
+
 class YandexApp(App):
     TITLE = "Яндекс Диск · резервная копия"
     SUB_TITLE = "Выбранные папки → ваш компьютер"
@@ -134,7 +144,7 @@ class YandexApp(App):
     def __init__(self, config_path):
         super().__init__()
         self.config_path = Path(config_path).expanduser().resolve()
-        self.settings = {"login": "", "app_password": "", "logs_dir": "logs", **download.transfers.DEFAULTS,
+        self.settings = {"backend": "webdav", "login": "", "app_password": "", "logs_dir": "logs", **download.transfers.DEFAULTS,
                          "jobs": [{"source": "/", "destination": ""}]}
         self.session_password = ""
         self.load_error = ""
@@ -147,6 +157,7 @@ class YandexApp(App):
                     if not isinstance(job, dict) or any(not isinstance(job.get(key, ""), str)
                                                         for key in ("source", "destination")):
                         raise ValueError("Каждая папка в jobs должна содержать текстовые source и destination")
+                passwords.credential_fields(loaded)
                 self.settings.update(loaded)
         except (OSError, ValueError) as error:
             self.load_error = f"Не удалось загрузить настройки: {error}"
@@ -166,28 +177,30 @@ class YandexApp(App):
         self.incomplete_jobs = False
 
     def compose(self) -> ComposeResult:
+        credential, encrypted_field = passwords.credential_fields(self.settings)
+        label, hint = credential_description(self.settings["backend"])
         yield Header()
         with TabbedContent(initial="settings-tab", id="tabs"):
             with TabPane("1 · Настройки", id="settings-tab"):
                 with VerticalScroll(id="settings-scroll"):
                     yield Static("АККАУНТ", classes="section")
+                    yield Label("Способ подключения")
+                    yield Select([("WebDAV · пароль приложения", "webdav"), ("REST API · токен Полигона", "rest")],
+                                 value=self.settings["backend"], allow_blank=False, id="backend")
                     yield Label("Логин Яндекса")
                     yield Input(str(self.settings["login"]), id="login", placeholder="login@yandex.ru")
-                    yield Label("Пароль приложения для Яндекс Диска")
-                    yield Input(str(self.settings.get("app_password", "")), password=True, id="password")
-                    yield Static("Создать: https://id.yandex.ru/security/app-passwords\n"
-                                 "Не основной пароль аккаунта. Без шифрования сохраняется открытым текстом (права 600).\n"
-                                 "Если пароль уже зашифрован, оставьте поле выше пустым и введите мастер-пароль ниже.",
-                                 classes="hint", id="password-hint", markup=False)
-                    with Collapsible(title="Мастер-пароль (необязательно)", collapsed="app_password_encrypted" not in self.settings):
-                        yield Checkbox("Шифровать пароль мастер-паролем", value="app_password_encrypted" in self.settings,
+                    yield Label(label, id="credential-label")
+                    yield Input(str(self.settings.get(credential, "")), password=True, id="password")
+                    yield Static(hint, classes="hint", id="password-hint", markup=False)
+                    with Collapsible(title="Мастер-пароль (необязательно)", collapsed=encrypted_field not in self.settings):
+                        yield Checkbox("Шифровать пароль/токен мастер-паролем", value=encrypted_field in self.settings,
                                        id="encrypt-password")
                         yield Label("Мастер-пароль (не сохраняется; минимум 12 символов, лучше случайные слова)")
                         yield Input(password=True, id="master-password")
-                        yield Label("Повторите мастер-пароль при включении шифрования или замене пароля Яндекса")
+                        yield Label("Повторите мастер-пароль при включении шифрования или замене пароля/токена")
                         yield Input(password=True, id="master-confirm")
                         yield Static("Чтобы отключить шифрование, снимите галочку и сохраните с текущим мастер-паролем.\n"
-                                     "Забытый мастер-пароль восстановить нельзя — потребуется новый пароль приложения Яндекса.",
+                                     "Забытый мастер-пароль восстановить нельзя — потребуется новый пароль приложения или токен.",
                                      classes="hint")
                     yield Static("ПАПКИ: НА ДИСКЕ → НА КОМПЬЮТЕРЕ", classes="section")
                     yield Static("Копируется содержимое папки вместе со всеми подпапками. Используйте отдельные папки назначения.",
@@ -242,10 +255,27 @@ class YandexApp(App):
         self.set_interval(0.25, self.poll_log)
         self.query_one("#login", Input).focus()
 
+    @on(Select.Changed, "#backend")
+    def backend_changed(self, event):
+        if event.value not in ("webdav", "rest"):
+            return
+        credential, encrypted_field = passwords.credential_fields({"backend": event.value})
+        label, hint = credential_description(event.value)
+        self.query_one("#credential-label", Label).update(label)
+        self.query_one("#password-hint", Static).update(hint)
+        self.query_one("#password", Input).value = self.settings.get(credential, "")
+        self.query_one("#encrypt-password", Checkbox).value = encrypted_field in self.settings
+        self.query_one("#master-password", Input).value = ""
+        self.query_one("#master-confirm", Input).value = ""
+
     def collect_settings(self):
+        # Не оставляем неактивные учётные данные открытым текстом после смены режима.
         config = {key: value for key, value in self.settings.items()
-                  if key not in ("retries", "low_level_retries", "app_password_encrypted")}
-        for key, identifier in (("login", "login"), ("app_password", "password"), ("logs_dir", "logs")):
+                  if key not in ("retries", "low_level_retries", "app_password", "app_password_encrypted", "oauth_token", "oauth_token_encrypted")}
+        config["backend"] = self.query_one("#backend", Select).value
+        credential, encrypted_field = passwords.credential_fields(config)
+        config[credential] = self.query_one("#password", Input).value
+        for key, identifier in (("login", "login"), ("logs_dir", "logs")):
             config[key] = self.query_one(f"#{identifier}", Input).value
         for key in download.transfers.DEFAULTS:
             try:
@@ -256,16 +286,16 @@ class YandexApp(App):
                            "destination": row.query_one(".destination", Input).value}
                           for row in self.query(JobRow)]
         master = self.query_one("#master-password", Input).value
-        replacing = bool(config["app_password"])
-        if not replacing and "app_password_encrypted" in self.settings:
-            config["app_password"] = passwords.decrypt_password(self.settings["app_password_encrypted"], master)
+        replacing = bool(config[credential])
+        if not replacing and encrypted_field in self.settings:
+            config[credential] = passwords.decrypt_password(self.settings[encrypted_field], master)
         download.validate(copy.deepcopy(config), self.config_path.parent)
-        password = config["app_password"]
+        password = config[credential]
         if self.query_one("#encrypt-password", Checkbox).value:
-            if (replacing or "app_password_encrypted" not in self.settings) and master != self.query_one("#master-confirm", Input).value:
+            if (replacing or encrypted_field not in self.settings) and master != self.query_one("#master-confirm", Input).value:
                 raise ValueError("Мастер-пароли не совпадают; настройки не изменены")
-            config["app_password_encrypted"] = passwords.encrypt_password(password, master)
-            del config["app_password"]
+            config[encrypted_field] = passwords.encrypt_password(password, master)
+            del config[credential]
         return config, password
 
     def save_settings(self):
@@ -274,7 +304,7 @@ class YandexApp(App):
             passwords.save_config(self.config_path, config)
             self.settings = config
             self.session_password = password
-            if "app_password_encrypted" in config:
+            if passwords.credential_fields(config)[1] in config:
                 self.query_one("#password", Input).value = ""
                 self.query_one("#master-confirm", Input).value = ""
             else:
@@ -332,14 +362,14 @@ class YandexApp(App):
         self.launch_download()
 
     def set_form_disabled(self, disabled):
-        for widget in self.query("#settings-tab Input, #settings-tab Button, #settings-tab Checkbox"):
+        for widget in self.query("#settings-tab Input, #settings-tab Button, #settings-tab Checkbox, #settings-tab Select"):
             widget.disabled = disabled
         self.query_one("#stop", Button).disabled = not disabled
 
     @work(exclusive=True)
     async def launch_download(self):
         try:
-            encrypted = "app_password_encrypted" in self.settings
+            encrypted = passwords.credential_fields(self.settings)[1] in self.settings
             self.process = await asyncio.create_subprocess_exec(
                 sys.executable, "-u", str(Path(__file__).with_name("download.py")),
                 str(self.config_path), "--events", *(["--password-stdin"] if encrypted else []),
@@ -389,7 +419,7 @@ class YandexApp(App):
                 self.exit(self.exit_code)
 
     def append_log(self, text):
-        for password in (self.session_password, self.settings.get("app_password", ""),
+        for password in (self.session_password, self.settings.get("app_password", ""), self.settings.get("oauth_token", ""),
                          self.query_one("#master-password", Input).value):
             if password:
                 text = text.replace(password, "***")
