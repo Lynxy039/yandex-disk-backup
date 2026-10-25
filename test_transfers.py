@@ -10,6 +10,14 @@ from unittest.mock import patch
 import transfers
 
 
+class ConfigTests(unittest.TestCase):
+    def test_uses_in_memory_config_instead_of_reserved_windows_device(self):
+        for device in ("nul", "/dev/null"):
+            with self.subTest(device=device), patch("transfers.os.devnull", device):
+                flags = transfers.flags({})
+                self.assertEqual(flags[flags.index("--config") + 1], "")
+
+
 class TransferTests(unittest.IsolatedAsyncioTestCase):
     async def test_downloads_first_file_before_discovery_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -14,6 +14,7 @@ import sys
 
 import transfers
 import passwords
+from process_control import StopRequested, run_with_stop
 from discovery import Inventory, stream_source as list_source
 
 
@@ -201,12 +202,13 @@ def run_job(job, folder, config, env, observer=None):
             finally:
                 await stream.aclose()
 
-        outcome = asyncio.run(transfers.run_files(entries, source, root, config, env, emit, discover=discover()))
+        outcome = asyncio.run(run_with_stop(
+            transfers.run_files(entries, source, root, config, env, emit, discover=discover()), config.get("_stop_file")))
         result["manifest_complete"] = outcome["discovery_complete"]
         result["status"] = "ok" if result["manifest_complete"] else "failed"
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, StopRequested):
         result["status"] = "interrupted"
-        raise
+        raise KeyboardInterrupt from None
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error) as error:
         result["status"] = "failed"
         result["error"] = str(error)
@@ -242,6 +244,7 @@ def main():
     parser.add_argument("config", nargs="?", default=str(Path(__file__).with_name("settings.json")))
     parser.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--password-stdin", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--stop-file", help=argparse.SUPPRESS)
     encryption = parser.add_mutually_exclusive_group()
     encryption.add_argument("--encrypt-password", action="store_true", help="Зашифровать пароль/токен мастер-паролем без запуска выгрузки")
     encryption.add_argument("--decrypt-password", action="store_true", help="Отключить шифрование пароля/токена без запуска выгрузки")
@@ -269,6 +272,7 @@ def main():
         env = rclone_environment(config)
         logs.mkdir(parents=True, exist_ok=True)
         config["_cache_dir"] = str(logs / ".inventory")
+        config["_stop_file"] = args.stop_file
         lock = logs / ".download.lock"
         try:
             descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -284,6 +288,8 @@ def main():
             status = "running"
             try:
                 for index, job in enumerate(config["jobs"], 1):
+                    if args.stop_file and Path(args.stop_file).is_file():
+                        raise KeyboardInterrupt
                     if observer:
                         results.append(run_job(job, run / f"{index:02d}", config, env, observer=observer))
                     else:

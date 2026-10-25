@@ -26,7 +26,8 @@ def safe_path(root, relative):
 
 def flags(config):
     idle = config.get("idle_timeout", DEFAULTS["idle_timeout"])
-    return ["--config", os.devnull, "--contimeout", f"{min(5, idle)}s", "--timeout", f"{idle}s",
+    # Пустой путь включает конфигурацию в памяти: /dev/null непереносим, а NUL отвергается rclone на Windows.
+    return ["--config", "", "--contimeout", f"{min(5, idle)}s", "--timeout", f"{idle}s",
             "--retries", "1", "--low-level-retries", "1", "--stats", "0",
             "--use-json-log", "--log-level", "ERROR"]
 

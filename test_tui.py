@@ -122,7 +122,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             original = asyncio.create_subprocess_exec
             async def launch(python, *args, **kwargs):
                 code = f"import download; download.remote_source=lambda *args: {str(source)!r}; raise SystemExit(download.main())"
-                return await original(python, "-u", "-c", code, str(config), "--events", **kwargs)
+                return await original(python, "-u", "-c", code, *args[2:], **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
                 async with app.run_test(size=(100, 32)) as pilot:
@@ -151,7 +151,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("случайные слова", str(args))
                 self.assertEqual(kwargs["stdin"], asyncio.subprocess.PIPE)
                 code = f"import download; download.remote_source=lambda *args: {str(source)!r}; raise SystemExit(download.main())"
-                return await original(python, "-u", "-c", code, str(config), "--events", "--password-stdin", **kwargs)
+                return await original(python, "-u", "-c", code, *args[2:], **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
                 async with app.run_test(size=(100, 32)) as pilot:
@@ -184,7 +184,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                         "async def listing(*args):\n"
                         " yield {'Path':'Фото.jpg','Size':5,'IsDir':False}\n"
                         "download.list_source=listing\nraise SystemExit(download.main())")
-                return await original(python, "-u", "-c", code, str(config), "--events", "--password-stdin", **kwargs)
+                return await original(python, "-u", "-c", code, *args[2:], **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
                 async with app.run_test(size=(100, 32)) as pilot:
@@ -239,7 +239,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                         f" while not Path({str(root / 'backup/found.jpg')!r}).exists(): await asyncio.sleep(.02)\n"
                         " raise RuntimeError('Обрыв списка')\n"
                         "download.list_source=discover\nraise SystemExit(download.main())\n")
-                return await original(python, "-u", "-c", code, str(config), "--events", **kwargs)
+                return await original(python, "-u", "-c", code, *args[2:], **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
                 async with app.run_test(size=(100, 32)) as pilot:
@@ -253,6 +253,12 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(summary["manifest_complete"])
 
     async def test_stop_interrupts_backend_and_saves_reports(self):
+        await self.assert_backend_stop(os.name == "nt")
+
+    async def test_windows_stop_marker_cancels_child_and_saves_reports(self):
+        await self.assert_backend_stop(True)
+
+    async def assert_backend_stop(self, file_control):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "settings.json"
@@ -260,7 +266,15 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 {"source": "/Фото", "destination": str(root / "backup")}] }))
             config.chmod(0o600)
             original = asyncio.create_subprocess_exec
+            stop_files = []
             async def launch(python, *args, **kwargs):
+                if file_control:
+                    self.assertIn("--stop-file", args)
+                    stop_files.append(Path(args[args.index("--stop-file") + 1]))
+                    self.assertEqual(kwargs["env"]["PYTHONUTF8"], "1")
+                    if os.name != "nt":
+                        self.assertEqual(kwargs.pop("creationflags"), 0x00000200)
+                        kwargs["start_new_session"] = True
                 code = ("import download, transfers, asyncio, sys\nfrom pathlib import Path\n"
                         "async def discover(*args):\n"
                         " yield {'Path':'hang.jpg','Size':10,'IsDir':False}\n"
@@ -271,9 +285,9 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                         " try: return await p.wait()\n"
                         " finally: await transfers.stop_process(p)\n"
                         "transfers.attempt=attempt\nraise SystemExit(download.main())\n")
-                return await original(python, "-u", "-c", code, str(config), "--events", **kwargs)
+                return await original(python, "-u", "-c", code, *args[2:], **kwargs)
             app = YandexApp(config)
-            with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
+            with patch("tui.WINDOWS", file_control), patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
                 async with app.run_test(size=(100, 32)) as pilot:
                     await pilot.press("f5")
                     await wait_until(pilot, lambda: (root / "child.pid").exists())
@@ -282,8 +296,16 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(app.exit_code, 130)
                     report = next((root / "logs").glob("*/01/summary.json"))
                     self.assertEqual(json.loads(report.read_text())["status"], "interrupted")
-                    with self.assertRaises(ProcessLookupError):
-                        os.kill(int((root / "child.pid").read_text()), 0)
+                    pid = int((root / "child.pid").read_text())
+                    if os.name == "nt":
+                        import subprocess
+                        result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True)
+                        self.assertNotIn(f'"{pid}"', result.stdout)
+                    else:
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(pid, 0)
+                    for marker in stop_files:
+                        self.assertFalse(marker.parent.exists())
 
     async def test_progress_events_and_failure_do_not_show_success(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,6 +2,7 @@ import base64
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -48,7 +49,8 @@ class PasswordTests(unittest.TestCase):
                 passwords.configure_encryption(path, config, True)
             encrypted = json.loads(path.read_text())
             self.assertNotIn("app_password", encrypted)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             original = path.read_bytes()
             with patch("passwords.prompt_master", return_value="ошибочный пароль"):
                 with self.assertRaises(ValueError):

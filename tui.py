@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+import tempfile
 import time
 
 from rich.text import Text
@@ -20,6 +21,7 @@ from textual.widgets import (Button, Checkbox, Collapsible, DataTable, Footer, H
 
 import download
 import passwords
+from process_control import WINDOWS, kill_tree, spawn_options
 
 
 class LogTail:
@@ -165,6 +167,8 @@ class YandexApp(App):
         self.stopping = False
         self.quit_after_stop = False
         self.process = None
+        self.control_directory = None
+        self.stop_file = None
         self.tail = None
         self.phase = "copy"
         self.phase_started = time.monotonic()
@@ -370,11 +374,15 @@ class YandexApp(App):
     async def launch_download(self):
         try:
             encrypted = passwords.credential_fields(self.settings)[1] in self.settings
+            if WINDOWS:
+                self.control_directory = tempfile.TemporaryDirectory(prefix="yadisk-control-")
+                self.stop_file = Path(self.control_directory.name) / "stop"
             self.process = await asyncio.create_subprocess_exec(
                 sys.executable, "-u", str(Path(__file__).with_name("download.py")),
                 str(self.config_path), "--events", *(["--password-stdin"] if encrypted else []),
+                *(["--stop-file", str(self.stop_file)] if self.stop_file else []),
                 stdin=asyncio.subprocess.PIPE if encrypted else None, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+                stderr=asyncio.subprocess.STDOUT, env=dict(os.environ, PYTHONUTF8="1"), **spawn_options(WINDOWS))
             if encrypted:
                 try:
                     self.process.stdin.write((json.dumps(self.session_password) + "\n").encode("utf-8"))
@@ -384,7 +392,7 @@ class YandexApp(App):
                 finally:
                     self.process.stdin.close()
             if self.stopping:
-                self.process.send_signal(signal.SIGINT)
+                self.request_backend_stop()
             while line := await self.process.stdout.readline():
                 text = line.decode("utf-8", errors="replace").strip()
                 try:
@@ -405,14 +413,17 @@ class YandexApp(App):
         finally:
             if self.process and self.process.returncode is None:
                 try:
-                    self.process.send_signal(signal.SIGINT)
+                    self.request_backend_stop()
                     await asyncio.wait_for(self.process.wait(), timeout=15)
                 except asyncio.TimeoutError:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                    await self.process.wait()
+                    await kill_tree(self.process, WINDOWS)
                 except ProcessLookupError:
                     pass
             self.process = None
+            if self.control_directory is not None:
+                self.control_directory.cleanup()
+                self.control_directory = None
+            self.stop_file = None
             self.running = False
             self.set_form_disabled(False)
             if self.quit_after_stop:
@@ -527,6 +538,12 @@ class YandexApp(App):
     def stop_pressed(self):
         self.action_stop()
 
+    def request_backend_stop(self):
+        if self.stop_file is not None:
+            self.stop_file.write_text("stop\n", encoding="ascii")
+        elif self.process and self.process.returncode is None:
+            self.process.send_signal(signal.SIGINT)
+
     def action_stop(self):
         if self.running and not self.stopping:
             self.stopping = True
@@ -534,7 +551,7 @@ class YandexApp(App):
             self.query_one("#stop", Button).disabled = True
             if self.process and self.process.returncode is None:
                 try:
-                    self.process.send_signal(signal.SIGINT)
+                    self.request_backend_stop()
                 except ProcessLookupError:
                     pass
 
@@ -560,8 +577,6 @@ def main():
     args = parser.parse_args()
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("TUI нужен интерактивный терминал. Для CLI используйте python3 download.py")
-    if os.name == "nt":
-        parser.error("Этот TUI рассчитан на macOS/Linux. На Windows доступен CLI download.py")
     return YandexApp(args.config).run() or 0
 
 

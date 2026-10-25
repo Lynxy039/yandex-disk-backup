@@ -17,5 +17,6 @@ __pycache__/
 *.pyc
 .venv/
 *.tmp
+.herdr-web-ui/
 .DS_Store
 ._*
