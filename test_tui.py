@@ -175,8 +175,9 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(app.exit_code, 0)
                     self.assertNotIn("app_password", json.loads(config.read_text()))
                     self.assertNotIn("app-secret", config.read_text())
-                    app.append_log("app-secret случайные слова для защиты")
-                    self.assertEqual(app.query_one("#run-log").lines[-1].text, "*** ***")
+                    with patch.object(app.query_one("#run-log"), "write") as write:
+                        app.append_log("app-secret случайные слова для защиты")
+                        self.assertEqual(write.call_args.args[0].plain, "*** ***")
 
     async def test_rest_switch_encrypts_token_and_launches_without_webdav_password(self):
         import passwords

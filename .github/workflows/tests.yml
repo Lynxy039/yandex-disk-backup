@@ -39,5 +39,13 @@ jobs:
       - name: Smoke-test Windows launcher
         if: runner.os == 'Windows'
         run: .\get-from-yadisk.cmd --help
+      - name: Install from ZIP (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'yandex-release.zip'
+          $target = Join-Path $env:RUNNER_TEMP 'yandex-release'
+          git archive --format=zip --output=$archive HEAD
+          Expand-Archive -LiteralPath $archive -DestinationPath $target
+          & (Join-Path $target 'get-from-yadisk.cmd') --setup-only
       - name: Run tests
         run: python -m unittest -v
