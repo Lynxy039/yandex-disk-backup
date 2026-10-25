@@ -1,0 +1,20 @@
+{
+  "login": "ВАШ_ЛОГИН_ЯНДЕКСА",
+  "app_password": "ВАШ_ПАРОЛЬ_ПРИЛОЖЕНИЯ_ДЛЯ_ДИСКА",
+  "jobs": [
+    {
+      "source": "/Фотографии",
+      "destination": "~/Pictures/YandexBackup/Фотографии"
+    },
+    {
+      "source": "/Загрузки с телефона",
+      "destination": "~/Pictures/YandexBackup/Загрузки с телефона"
+    }
+  ],
+  "logs_dir": "logs",
+  "transfers": 2,
+  "idle_timeout": 8,
+  "file_timeout": 20,
+  "retry_passes": 2,
+  "listing_timeout": 180
+}
