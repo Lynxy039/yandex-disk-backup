@@ -16,6 +16,7 @@ download.log
 __pycache__/
 *.pyc
 .venv/
+.tools/
 *.tmp
 .herdr-web-ui/
 .DS_Store

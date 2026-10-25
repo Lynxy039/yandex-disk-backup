@@ -261,8 +261,10 @@ class YandexApp(App):
 
     @on(Select.Changed, "#backend")
     def backend_changed(self, event):
-        if event.value not in ("webdav", "rest"):
+        if event.value not in ("webdav", "rest") or event.value != event.select.value:
             return
+        if not self.is_running or not self.query("#credential-label"):
+            return  # Начальная композиция/демонтаж формы ещё могут присылать события Select.
         credential, encrypted_field = passwords.credential_fields({"backend": event.value})
         label, hint = credential_description(event.value)
         self.query_one("#credential-label", Label).update(label)

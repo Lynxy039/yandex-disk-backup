@@ -77,6 +77,19 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(saved["app_password"], "app-secret")
                 self.assertNotIn("app_password_encrypted", saved)
 
+    async def test_stale_backend_event_does_not_clear_token_or_touch_unmounted_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = YandexApp(Path(tmp) / "settings.json")
+            async with app.run_test(size=(100, 32)) as pilot:
+                selector = app.query_one("#backend", Select)
+                selector.value = "rest"
+                await wait_until(pilot, lambda: "OAuth" in str(app.query_one("#credential-label").render()))
+                app.query_one("#password", Input).value = "new-token"
+                app.backend_changed(Select.Changed(selector, "webdav"))
+                self.assertEqual(app.query_one("#password", Input).value, "new-token")
+                await app.query_one("#credential-label").remove()
+                app.backend_changed(Select.Changed(selector, "rest"))
+
     async def test_rejects_bad_settings_without_starting(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
@@ -189,7 +202,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):
                 async with app.run_test(size=(100, 32)) as pilot:
                     app.query_one("#backend", Select).value = "rest"
-                    await pilot.pause()
+                    await wait_until(pilot, lambda: "OAuth" in str(app.query_one("#credential-label").render()))
                     self.assertEqual(app.query_one("#password", Input).value, "")
                     self.assertIn("OAuth", str(app.query_one("#credential-label").render()))
                     app.query_one("#password", Input).value = "test-polygon-token"
@@ -215,7 +228,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(reopened.save_settings())
                 self.assertEqual(json.loads(config.read_text())["oauth_token"], "test-polygon-token")
                 reopened.query_one("#backend", Select).value = "webdav"
-                await pilot.pause()
+                await wait_until(pilot, lambda: "OAuth" not in str(reopened.query_one("#credential-label").render()))
                 self.assertEqual(reopened.query_one("#password", Input).value, "")
                 self.assertFalse(reopened.save_settings())
                 self.assertEqual(json.loads(config.read_text())["backend"], "rest")

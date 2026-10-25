@@ -1,13 +1,6 @@
 @echo off
 setlocal
-set "PYTHON=%~dp0.venv\Scripts\python.exe"
-if not exist "%PYTHON%" set "PYTHON=python"
-"%PYTHON%" -c "import textual" >nul 2>&1
-if errorlevel 1 (
-  echo Install dependencies first:
-  echo   python -m venv .venv
-  echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
-  exit /b 1
-)
-"%PYTHON%" "%~dp0tui.py" %*
-exit /b %ERRORLEVEL%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0get-from-yadisk.ps1" %*
+set "RESULT=%ERRORLEVEL%"
+if not "%RESULT%"=="0" if not defined CI pause
+exit /b %RESULT%
