@@ -7,6 +7,8 @@ import ssl
 import tempfile
 import threading
 import unittest
+
+import httpx
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -22,6 +24,8 @@ import transfers
 class NativeRestTests(unittest.TestCase):
     def test_native_backend_lists_downloads_and_resumes_without_refresh_or_mutation(self):
         requests = []
+        downloaded = threading.Event()
+        downloaded_before_page = []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -55,6 +59,7 @@ class NativeRestTests(unittest.TestCase):
                     query = parse_qs(parsed.query)
                     if parsed.path == "/fixture":
                         self.reply(200, b"abc", "application/octet-stream")
+                        downloaded.set()
                     elif parsed.path == "/v1/disk/resources/download":
                         self.reply(200, {"href": "https://downloader.disk.yandex.ru/fixture", "method": "GET", "templated": False})
                     elif parsed.path == "/v1/disk/resources":
@@ -65,8 +70,15 @@ class NativeRestTests(unittest.TestCase):
                             self.reply(200, file)
                         else:
                             offset = int(query.get("offset", [0])[0])
+                            if path.endswith("/Пустая"):
+                                items, total = [], 0
+                            elif offset:
+                                downloaded_before_page.append(downloaded.wait(timeout=3))
+                                items, total = [{"path": "disk:/Фото/Пустая", "type": "dir"}], 2
+                            else:
+                                items, total = [file], 2
                             self.reply(200, {"name": "Фото", "path": "disk:/Фото", "type": "dir",
-                                             "_embedded": {"items": [] if offset else [file], "total": 1,
+                                             "_embedded": {"items": items, "total": total,
                                                            "limit": int(query.get("limit", [1000])[0]), "offset": offset}})
                     elif parsed.path.rstrip("/") == "/v1/disk":
                         self.reply(200, {"total_space": 1000, "used_space": 3})
@@ -105,13 +117,19 @@ class NativeRestTests(unittest.TestCase):
                     # Только тестовый self-signed HTTPS-стенд. В рабочем коде проверка сертификатов включена.
                     return [*original_flags(settings), "--no-check-certificate"]
                 job = {"source": "/Фото", "destination": str(root / "backup")}
-                with patch("transfers.flags", side_effect=fixture_flags):
+                original_client = httpx.AsyncClient
+                def fixture_client(**kwargs):
+                    # И постраничный HTTPX-обход, и rclone идут только через локальный стенд.
+                    return original_client(proxy=proxy, verify=False, trust_env=False, **kwargs)
+                with patch("transfers.flags", side_effect=fixture_flags), patch("httpx.AsyncClient", side_effect=fixture_client):
                     first = download.run_job(job, root / "run1", config, env)
                     before = len([request for request in requests if request[1] == "/fixture"])
                     second = download.run_job(job, root / "run2", config, env)
                 self.assertEqual(first["status"], "ok", requests)
                 self.assertEqual(first["downloaded"], 1)
                 self.assertEqual((root / "backup/fixture.jpg").read_bytes(), b"abc")
+                self.assertTrue((root / "backup/Пустая").is_dir())
+                self.assertTrue(downloaded_before_page and all(downloaded_before_page))
                 self.assertEqual(second["status"], "ok")
                 self.assertEqual(second["present"], 1)
                 self.assertEqual(second["cached_files"], 1)

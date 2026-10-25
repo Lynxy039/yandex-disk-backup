@@ -179,7 +179,11 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             async def launch(python, *args, **kwargs):
                 self.assertIn("--password-stdin", args)
                 self.assertNotIn("test-polygon-token", str(args))
-                code = f"import download; download.remote_source=lambda *args: {str(source)!r}; raise SystemExit(download.main())"
+                code = ("import download\n"
+                        f"download.remote_source=lambda *args: {str(source)!r}\n"
+                        "async def listing(*args):\n"
+                        " yield {'Path':'Фото.jpg','Size':5,'IsDir':False}\n"
+                        "download.list_source=listing\nraise SystemExit(download.main())")
                 return await original(python, "-u", "-c", code, str(config), "--events", "--password-stdin", **kwargs)
             app = YandexApp(config)
             with patch("tui.asyncio.create_subprocess_exec", side_effect=launch):

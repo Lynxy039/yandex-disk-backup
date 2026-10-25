@@ -1,6 +1,8 @@
 """Потоковый список rclone и сохраняемый индекс уже найденных путей."""
 import asyncio
+from collections import deque
 import json
+from pathlib import PurePosixPath
 import sqlite3
 import time
 import uuid
@@ -35,7 +37,71 @@ class Inventory:
         self.db.close()
 
 
+async def stream_rest(source, folder, config):
+    import httpx
+
+    timeout = config.get("listing_timeout", transfers.DEFAULTS["listing_timeout"])
+    if not source.startswith(":yandex:"):
+        raise ValueError("REST-обход ожидает источник :yandex:")
+    root = str(PurePosixPath("/" + source.removeprefix(":yandex:").strip("/")))
+    prefix = root.rstrip("/") + "/"
+    pending = deque([root])
+    seen = {root}
+    fields = "type,_embedded.total,_embedded.items.path,_embedded.items.type,_embedded.items.size"
+    try:
+        async with httpx.AsyncClient(headers={"Authorization": "OAuth " + config["oauth_token"]},
+                                     timeout=httpx.Timeout(min(60, timeout), connect=min(5, timeout))) as client:
+            while pending:
+                directory = pending.popleft()
+                offset = 0
+                while True:
+                    response = await asyncio.wait_for(client.get("https://cloud-api.yandex.net/v1/disk/resources",
+                        params={"path": "disk:" + directory, "limit": 1000, "offset": offset, "fields": fields}), timeout=timeout)
+                    if response.status_code != 200:
+                        hint = "; проверьте токен и права доступа" if response.status_code in (401, 403) else ""
+                        raise RuntimeError(f"REST API: HTTP {response.status_code}{hint}")
+                    page = response.json()
+                    embedded = page["_embedded"]
+                    items, total = embedded["items"], embedded["total"]
+                    if page.get("type") != "dir" or not isinstance(items, list) or type(total) is not int or total < 0:
+                        raise ValueError("Некорректная страница списка")
+                    if (not items and offset < total) or offset + len(items) > total:
+                        raise RuntimeError("REST API: неполная или изменившаяся страница списка")
+                    for item in items:
+                        raw_path, kind = item["path"], item["type"]
+                        if not isinstance(raw_path, str) or not raw_path.startswith("disk:") or kind not in ("dir", "file"):
+                            raise ValueError("Некорректный элемент REST-списка")
+                        path = raw_path[5:].rstrip("/")
+                        if not path.startswith(prefix) or ".." in PurePosixPath(path).parts or str(PurePosixPath(path).parent) != directory:
+                            raise ValueError("Путь REST-списка вне текущей папки")
+                        if kind == "dir" and path not in seen:
+                            pending.append(path)
+                            seen.add(path)
+                        yield {"Path": path[len(prefix):], "Size": 0 if kind == "dir" else item["size"], "IsDir": kind == "dir"}
+                    offset += len(items)
+                    if offset >= total:
+                        break
+    except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        if isinstance(error, RuntimeError):
+            message = str(error)
+        elif isinstance(error, (httpx.HTTPError, asyncio.TimeoutError)):
+            message = f"REST: ошибка сети/таймаут страницы ({type(error).__name__})"
+        else:
+            message = "REST: некорректная страница списка; полный обход не подтверждён"
+        with (folder / "listing.jsonl").open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"level": "error", "msg": message}, ensure_ascii=False) + "\n")
+        raise RuntimeError(message) from None
+
+
 async def stream_source(source, folder, config, env):
+    if config.get("backend", "webdav") == "rest":
+        stream = stream_rest(source, folder, config)
+        try:
+            async for item in stream:
+                yield item
+        finally:
+            await stream.aclose()
+        return
     timeout = config.get("listing_timeout", transfers.DEFAULTS["listing_timeout"])
     listing_config = dict(config, idle_timeout=min(60, timeout))
     with (folder / "listing.jsonl").open("a", encoding="utf-8") as errors:
