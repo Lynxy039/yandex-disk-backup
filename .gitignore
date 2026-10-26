@@ -9,6 +9,8 @@ logs/
 .inventory/
 .download.lock
 download.log
+retry.json
+retry-*.json
 *.jsonl
 *.sqlite3
 *.sqlite3-*

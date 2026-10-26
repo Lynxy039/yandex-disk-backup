@@ -44,6 +44,28 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 if os.name != "nt":
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    async def test_saves_retry_queue_per_job_and_restores_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = root / "retry.json"
+            queue.write_text(json.dumps({"format": "yandex-disk-backup-retry", "version": 1,
+                "login": "demo", "source": "/Фото", "manifest_complete": True, "files": []}))
+            app = YandexApp(root / "settings.json")
+            async with app.run_test(size=(120, 45)):
+                app.query_one("#login", Input).value = "demo"
+                app.query_one("#password", Input).value = "secret"
+                row = app.query_one(JobRow)
+                row.query_one(".source", Input).value = "/Фото"
+                row.query_one(".destination", Input).value = str(root / "photos")
+                row.query_one(".retry-from", Input).value = str(queue)
+                self.assertTrue(app.save_settings())
+                self.assertEqual(app.settings["jobs"][0]["retry_from"], str(queue))
+                app.handle_event({"type": "phase", "phase": "copy", "log": str(root / "copy.jsonl"), "scope": "retry_queue"})
+                self.assertIn("только по сохранённой очереди", str(app.query_one("#phase", Static).render()))
+            restored = YandexApp(root / "settings.json")
+            async with restored.run_test(size=(120, 45)):
+                self.assertEqual(restored.query_one(".retry-from", Input).value, str(queue))
+
     async def test_enables_encryption_and_can_disable_after_unlock(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
@@ -106,6 +128,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             app = YandexApp(Path(tmp) / "settings.json")
             async with app.run_test(size=(120, 45)) as pilot:
+                app.query_one("#add").scroll_visible(immediate=True)
+                await pilot.pause()
                 await pilot.click("#add")
                 await pilot.pause()
                 self.assertEqual(len(app.query(JobRow)), 2)

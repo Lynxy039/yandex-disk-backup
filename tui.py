@@ -57,16 +57,22 @@ def size(value):
         value /= 1024
 
 
-class JobRow(Horizontal):
-    def __init__(self, source="/", destination="", **kwargs):
+class JobRow(Vertical):
+    def __init__(self, source="/", destination="", retry_from="", **kwargs):
         super().__init__(**kwargs)
         self.source = source
         self.destination = destination
+        self.retry_from = retry_from
 
     def compose(self) -> ComposeResult:
-        yield Input(self.source, placeholder="/Фото/Отпуск", classes="source")
-        yield Input(self.destination, placeholder="~/Pictures/Backup/Отпуск", classes="destination")
-        yield Button("Удалить", classes="remove", variant="error")
+        with Horizontal(classes="job-paths"):
+            yield Input(self.source, placeholder="/Фото/Отпуск", classes="source")
+            yield Input(self.destination, placeholder="~/Pictures/Backup/Отпуск", classes="destination")
+            yield Button("Удалить", classes="remove", variant="error")
+        with Collapsible(title="Докачка по сохранённому остатку (необязательно)", collapsed=not self.retry_from):
+            yield Input(self.retry_from, placeholder="Путь к retry.json или папке старого отчёта", classes="retry-from")
+            yield Static("Заполнено → только остаток, без полного обхода. Очередь обновится после завершения/F8.\n"
+                         "Можно выбрать другую папку назначения. Для обычной выгрузки очистите это поле.", classes="hint")
 
     @on(Button.Pressed, ".remove")
     async def remove_row(self, event):
@@ -112,7 +118,8 @@ class YandexApp(App):
     .hint { color: $text-muted; height: auto; margin-bottom: 1; }
     #password-hint { margin-top: 1; }
     Input { margin-bottom: 1; }
-    JobRow { height: 4; }
+    JobRow { height: auto; }
+    .job-paths { height: 4; }
     JobRow Input { width: 1fr; margin-right: 1; }
     JobRow Button { min-width: 10; width: 12; }
     #jobs { height: auto; }
@@ -157,7 +164,7 @@ class YandexApp(App):
                     raise ValueError("Ожидался объект настроек со списком jobs")
                 for job in loaded.get("jobs", []):
                     if not isinstance(job, dict) or any(not isinstance(job.get(key, ""), str)
-                                                        for key in ("source", "destination")):
+                                                        for key in ("source", "destination", "retry_from")):
                         raise ValueError("Каждая папка в jobs должна содержать текстовые source и destination")
                 passwords.credential_fields(loaded)
                 self.settings.update(loaded)
@@ -211,7 +218,7 @@ class YandexApp(App):
                                  classes="hint")
                     with Vertical(id="jobs"):
                         for job in self.settings["jobs"]:
-                            yield JobRow(job.get("source", "/"), job.get("destination", ""))
+                            yield JobRow(job.get("source", "/"), job.get("destination", ""), job.get("retry_from", ""))
                     yield Button("+ Добавить папку", id="add")
                     with Collapsible(title="Таймауты, очередь и папка логов", collapsed=True):
                         yield Label("Папка журналов (относительно файла настроек или абсолютный путь)")
@@ -291,6 +298,10 @@ class YandexApp(App):
         config["jobs"] = [{"source": row.query_one(".source", Input).value,
                            "destination": row.query_one(".destination", Input).value}
                           for row in self.query(JobRow)]
+        for row, job in zip(self.query(JobRow), config["jobs"]):
+            selected = row.query_one(".retry-from", Input).value.strip()
+            if selected:
+                job["retry_from"] = selected
         master = self.query_one("#master-password", Input).value
         replacing = bool(config[credential])
         if not replacing and encrypted_field in self.settings:
@@ -457,8 +468,8 @@ class YandexApp(App):
             self.phase = event["phase"]
             self.phase_started = time.monotonic()
             self.tail = LogTail(event["log"])
-            label = {"copy": "Обход и скачивание идут параллельно…",
-                     "check": "Проверка локальных размеров по списку Диска…"}[self.phase]
+            label = {"copy": "Докачка только по сохранённой очереди…" if event.get("scope") == "retry_queue" else "Обход и скачивание идут параллельно…",
+                     "check": "Проверка локальных размеров по выбранному списку…"}[self.phase]
             self.query_one("#phase", Static).update(label)
             self.update_row({"copy": "Скачивание", "check": "Проверка"}[self.phase])
             self.query_one("#stats", Static).update("")
@@ -472,10 +483,13 @@ class YandexApp(App):
             label = "Неполный список" if incomplete else {"ok": "Готово", "failed": "Ошибка", "interrupted": "Остановлено"}.get(status, status)
             self.update_row(label)
             self.append_log(f"Результат папки: {label}. Отчёт: {event['folder']}")
+            queue = event["result"].get("retry_queue_updated") or event["result"].get("retry_queue")
+            if queue:
+                self.append_log(f"Очередь остатка: {queue}")
         elif kind == "run_finished":
             self.poll_log()
             self.final_event = True
-            label = {"ok": "Всё скачано и проверено", "failed": "Завершено с ошибками — проверьте отчёты",
+            label = {"ok": "Скачано и проверено по выбранным заданиям", "failed": "Завершено с ошибками — проверьте отчёты",
                      "interrupted": "Остановлено. Можно запустить повторно"}.get(event["status"], event["status"])
             if event["status"] == "failed" and self.incomplete_jobs:
                 label = "Завершено: список неполный — проверьте отчёты"

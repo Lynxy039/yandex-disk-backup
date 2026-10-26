@@ -14,12 +14,13 @@ import sys
 
 import transfers
 import passwords
+import retry_queue
 from process_control import StopRequested, run_with_stop
 from discovery import Inventory, stream_source as list_source
 
 
 def save_json(path, data):
-    temporary = path.with_suffix(".tmp")
+    temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
 
@@ -34,8 +35,10 @@ def validate(config, base):
     jobs = config.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("jobs должен содержать хотя бы одну папку")
-    destinations = []
+    destinations, retry_paths = [], []
     for job in jobs:
+        if not isinstance(job, dict):
+            raise ValueError("Каждое задание jobs должно быть JSON-объектом")
         source = job.get("source")
         if not isinstance(source, str) or not source.startswith("/") or ".." in PurePosixPath(source).parts:
             raise ValueError("source должен быть абсолютным путём на Диске без '..'")
@@ -50,6 +53,18 @@ def validate(config, base):
                 raise ValueError("Папки назначения не должны совпадать или быть вложены друг в друга")
         destinations.append(path)
         job["destination"] = str(path)
+        if not isinstance(job.get("retry_from", ""), str):
+            raise ValueError("retry_from должен содержать путь к очереди докачки")
+        if job.get("retry_from"):
+            selected = (base / Path(job["retry_from"]).expanduser()).resolve()
+            _, checkpoint = retry_queue.load(selected, job, config["login"])
+            if checkpoint in retry_paths:
+                raise ValueError("Одна очередь докачки не должна использоваться в нескольких заданиях")
+            retry_paths.append(checkpoint)
+            job["retry_from"] = str(selected)
+    for checkpoint in retry_paths:
+        if any(checkpoint == dest or dest in checkpoint.parents for dest in destinations):
+            raise ValueError("Очередь докачки должна находиться отдельно от всех папок назначения")
     for key, default in transfers.DEFAULTS.items():
         value = config.get(key, default)
         minimum = 1
@@ -117,10 +132,13 @@ def write_reports(entries, root, folder, interrupted):
 def run_job(job, folder, config, env, observer=None):
     folder.mkdir(parents=True, exist_ok=False)
     root = Path(job["destination"])
-    result = {"source": job["source"], "destination": str(root), "backend": config.get("backend", "webdav"), "status": "running",
+    result = {"source": job["source"], "destination": str(root), "login": config.get("login", ""),
+              "scope": "retry_queue" if job.get("retry_from") else "full",
+              "backend": config.get("backend", "webdav"), "status": "running",
               "manifest_complete": False, "verification_complete": False, "passes_completed": 0}
     entries, directories = [], set()
     inventory = None
+    retry_data, checkpoint = None, None
     save_json(folder / "summary.json", result)
     log = (folder / "copy.jsonl").open("a", encoding="utf-8", buffering=1)
     downloaded = (folder / "downloaded.jsonl").open("a", encoding="utf-8", buffering=1)
@@ -153,7 +171,7 @@ def run_job(job, folder, config, env, observer=None):
 
     def phase(name, filename):
         if observer:
-            observer({"type": "phase", "phase": name, "log": str(folder / filename)})
+            observer({"type": "phase", "phase": name, "log": str(folder / filename), "scope": result["scope"]})
 
     if observer:
         observer({"type": "job_started", "source": job["source"], "destination": str(root), "folder": str(folder)})
@@ -165,13 +183,22 @@ def run_job(job, folder, config, env, observer=None):
         phase("copy", "copy.jsonl")
         if "retry_passes" in config:
             emit({"msg": "retry_passes больше не ограничивает повторы: докачиваю остаток до прохода без новых загрузок"})
-        identity_parts = [config.get("login", ""), job["source"], str(root.resolve())]
-        if config.get("backend", "webdav") == "rest":
-            identity_parts.append("rest")  # Не смешиваем индекс WebDAV с ещё не проверенным REST-аккаунтом.
-        identity = json.dumps(identity_parts, ensure_ascii=False)
-        key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        cache_dir = Path(config.get("_cache_dir", folder.parent / ".inventory"))
-        inventory = Inventory(cache_dir / f"{key}.sqlite3")
+        if job.get("retry_from"):
+            retry_data, checkpoint = retry_queue.load(job["retry_from"], job, config.get("login", ""))
+            entries.extend({"path": item["path"], "size": item["size"], "status": "pending", "attempts": 0}
+                           for item in retry_data["files"])
+            result["manifest_complete"] = retry_data["manifest_complete"]
+            emit({"msg": f"Докачка по сохранённой очереди: {len(retry_data['files'])} файлов. Полный обход отключён."})
+            if retry_data.get("login") is None:
+                emit({"msg": "В старом отчёте нет логина: убедитесь, что выбран исходный аккаунт Яндекса", "level": "warning"})
+        else:
+            identity_parts = [config.get("login", ""), job["source"], str(root.resolve())]
+            if config.get("backend", "webdav") == "rest":
+                identity_parts.append("rest")  # Не смешиваем индекс WebDAV с ещё не проверенным REST-аккаунтом.
+            identity = json.dumps(identity_parts, ensure_ascii=False)
+            key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            cache_dir = Path(config.get("_cache_dir", folder.parent / ".inventory"))
+            inventory = Inventory(cache_dir / f"{key}.sqlite3")
 
         def record(item, origin):
             path, size, is_dir = item["Path"], item["Size"], item["IsDir"]
@@ -187,12 +214,16 @@ def run_job(job, folder, config, env, observer=None):
                 return None
             return {"path": path, "size": size, "status": "pending", "attempts": 0}
 
-        for item in inventory.cached():
-            entry = record(item, "cache")
-            if entry is not None:
-                entries.append(entry)
-        result["cached_files"] = len(entries)
-        emit({"msg": f"Из сохранённого индекса загружено файлов: {len(entries)}"})
+        if retry_data is not None:
+            for item in retry_data["files"]:
+                record({"Path": item["path"], "Size": item["size"], "IsDir": False}, "retry")
+        else:
+            for item in inventory.cached():
+                entry = record(item, "cache")
+                if entry is not None:
+                    entries.append(entry)
+            result["cached_files"] = len(entries)
+            emit({"msg": f"Из сохранённого индекса загружено файлов: {len(entries)}"})
 
         async def discover():
             stream = list_source(source, folder, config, env)
@@ -208,8 +239,12 @@ def run_job(job, folder, config, env, observer=None):
                 await stream.aclose()
 
         outcome = asyncio.run(run_with_stop(
-            transfers.run_files(entries, source, root, config, env, emit, discover=discover()), config.get("_stop_file")))
-        result["manifest_complete"] = outcome["discovery_complete"]
+            transfers.run_files(entries, source, root, config, env, emit,
+                                discover=discover() if retry_data is None else None), config.get("_stop_file")))
+        result["manifest_complete"] = retry_data["manifest_complete"] if retry_data is not None else outcome["discovery_complete"]
+        if retry_data is not None and not result["manifest_complete"]:
+            result["error"] = "Остаток обработан, но исходный обход был неполным: нужен обычный полный запуск"
+            emit({"msg": result["error"], "level": "warning"})
         result["passes_completed"] = outcome["passes_completed"]
         result["stop_reason"] = outcome["stop_reason"]
         result["status"] = "ok" if result["manifest_complete"] else "failed"
@@ -226,7 +261,7 @@ def run_job(job, folder, config, env, observer=None):
         failures = write_reports(entries, root, folder, result["status"] == "interrupted")
         result["files"] = len(entries)
         save_json(folder / "manifest.json", {"files": entries, "directories": sorted(directories),
-                                             "complete": result["manifest_complete"]})
+                                             "complete": result["manifest_complete"], "scope": result["scope"]})
         result["failed"] = failures
         result["downloaded"] = sum(item["status"] == "downloaded" for item in entries)
         result["present"] = sum(item["status"] == "present" for item in entries)
@@ -234,6 +269,22 @@ def run_job(job, folder, config, env, observer=None):
         result["verification_complete"] = result["manifest_complete"] and result["known_files_verified"] and result["status"] == "ok"
         if result["status"] == "ok" and failures:
             result["status"] = "failed"
+        if not job.get("retry_from") or retry_data is not None:
+            remaining = {"format": retry_queue.FORMAT, "version": 1, "login": config.get("login", ""),
+                         "source": job["source"], "manifest_complete": result["manifest_complete"],
+                         "files": [{"path": item["path"], "size": item["size"]} for item in entries
+                                   if item["status"] not in ("downloaded", "present")]}
+            try:
+                save_json(folder / "retry.json", remaining)
+                result["retry_queue"] = str(folder / "retry.json")
+                if checkpoint is not None:
+                    save_json(checkpoint, remaining)
+                    result["retry_queue_updated"] = str(checkpoint)
+            except OSError as error:
+                result["status"] = "failed"
+                result["verification_complete"] = False
+                result["error"] = f"Не удалось сохранить очередь докачки: {error}"
+                emit({"msg": result["error"], "level": "error"})
         log.close()
         downloaded.close()
         manifest_log.close()
@@ -250,6 +301,7 @@ def run_job(job, folder, config, env, observer=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", nargs="?", default=str(Path(__file__).with_name("settings.json")))
+    parser.add_argument("--retry-from", help="Докачать только сохранённый остаток (retry.json, failed.jsonl или папка отчёта); для одного задания")
     parser.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--password-stdin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--stop-file", help=argparse.SUPPRESS)
@@ -273,6 +325,10 @@ def main():
         credential, encrypted_field = passwords.credential_fields(config)
         if encrypted_field in config or args.password_stdin:
             config[credential] = passwords.read_password(config, from_stdin=args.password_stdin)
+        if args.retry_from:
+            if not isinstance(config.get("jobs"), list) or len(config["jobs"]) != 1:
+                raise ValueError("--retry-from требует ровно одно задание в jobs")
+            config["jobs"][0]["retry_from"] = str(Path(args.retry_from).expanduser().resolve())
         logs = validate(config, config_path.parent)
         if not shutil.which("rclone"):
             raise ValueError("Установите rclone: brew install rclone (macOS) или sudo apt install rclone (Ubuntu)")
