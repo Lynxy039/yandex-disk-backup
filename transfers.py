@@ -6,8 +6,7 @@ from pathlib import Path, PurePosixPath
 import tempfile
 import time
 
-DEFAULTS = {"transfers": 2, "idle_timeout": 8, "file_timeout": 20,
-            "retry_passes": 2, "listing_timeout": 180}
+DEFAULTS = {"transfers": 2, "idle_timeout": 8, "file_timeout": 20, "listing_timeout": 180}
 
 
 def safe_path(root, relative):
@@ -104,6 +103,8 @@ async def run_files(entries, source, root, config, env, emit, discover=None):
     positions = {item["path"]: index for index, item in enumerate(entries)}
     counts = {"downloaded": 0, "present": 0, "deferred": 0, "failed": 0}
     downloaded_bytes = 0
+    successful_downloads, pass_start_downloads = 0, 0
+    stop_reason = None
     total_bytes = sum(item["size"] for item in entries)
     current_pass, pass_total = 0, len(entries)
     processed = set()
@@ -135,7 +136,8 @@ async def run_files(entries, source, root, config, env, emit, discover=None):
                         "transfers": counts["downloaded"], "totalTransfers": len(entries),
                         "present": counts["present"], "deferred": counts["deferred"],
                         "errors": counts["failed"], "processed": len(processed), "passTotal": pass_total,
-                        "pass": current_pass + 1, "passes": config.get("retry_passes", DEFAULTS["retry_passes"]) + 1,
+                        "pass": current_pass + 1, "passes": None, "passDownloaded": successful_downloads - pass_start_downloads,
+                        "stop_reason": stop_reason,
                         "discovering": discovering, "discovery_idle": now - last_discovered, **discovery_result,
                         "eta": None, "listed": len(entries), "transferring": list(active.values())}})
 
@@ -145,7 +147,7 @@ async def run_files(entries, source, root, config, env, emit, discover=None):
             await asyncio.sleep(.5)
 
     async def transfer_one(item):
-        nonlocal downloaded_bytes
+        nonlocal downloaded_bytes, successful_downloads
         temporary = None
         try:
             destination = safe_path(root, item["path"])
@@ -166,6 +168,7 @@ async def run_files(entries, source, root, config, env, emit, discover=None):
                 destination = safe_path(root, item["path"])
                 os.replace(temporary, destination)
                 downloaded_bytes += item["size"]
+                successful_downloads += 1
                 change(item, "downloaded")
             else:
                 change(item, "deferred", reason)
@@ -255,20 +258,28 @@ async def run_files(entries, source, root, config, env, emit, discover=None):
 
     monitoring = asyncio.create_task(monitor())
     try:
-        emit({"pass_started": 1, "remaining": len(entries)})
-        await run_pass(list(entries), producer=True)
-        for pass_index in range(1, config.get("retry_passes", DEFAULTS["retry_passes"]) + 1):
-            pending = [item for item in entries if item["status"] == "deferred"]
-            if not pending:
-                break
-            current_pass, pass_total = pass_index, len(pending)
-            processed.clear()
+        pending = list(entries)
+        while True:
+            pass_start_downloads = successful_downloads
             emit({"pass_started": current_pass + 1, "remaining": len(pending)})
-            await run_pass(pending)
+            await run_pass(pending, producer=current_pass == 0)
+            pending = [item for item in (entries if current_pass == 0 else pending) if item["status"] == "deferred"]
+            newly_downloaded = successful_downloads - pass_start_downloads
+            emit({"pass_finished": current_pass + 1, "downloaded": newly_downloaded, "remaining": len(pending)})
+            if not pending:
+                stop_reason = "queue_finished"
+                break
+            if not newly_downloaded:
+                stop_reason = "no_progress"
+                emit({"stop_reason": stop_reason, "msg": "Проход без новых загрузок — останавливаю повторы", "remaining": len(pending)})
+                break
+            current_pass += 1
+            pass_total = len(pending)
+            processed.clear()
         for item in entries:
             if item["status"] == "deferred":
                 change(item, "failed", item["reason"])
-        return discovery_result
+        return {**discovery_result, "passes_completed": current_pass + 1, "stop_reason": stop_reason}
     finally:
         monitoring.cancel()
         await asyncio.gather(monitoring, return_exceptions=True)

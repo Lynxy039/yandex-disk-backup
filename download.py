@@ -52,7 +52,7 @@ def validate(config, base):
         job["destination"] = str(path)
     for key, default in transfers.DEFAULTS.items():
         value = config.get(key, default)
-        minimum = 0 if key == "retry_passes" else 1
+        minimum = 1
         if type(value) is not int or value < minimum:
             raise ValueError(f"{key} должен быть целым числом не меньше {minimum}")
     logs = (base / Path(config.get("logs_dir", "logs")).expanduser()).resolve()
@@ -118,7 +118,7 @@ def run_job(job, folder, config, env, observer=None):
     folder.mkdir(parents=True, exist_ok=False)
     root = Path(job["destination"])
     result = {"source": job["source"], "destination": str(root), "backend": config.get("backend", "webdav"), "status": "running",
-              "manifest_complete": False, "verification_complete": False}
+              "manifest_complete": False, "verification_complete": False, "passes_completed": 0}
     entries, directories = [], set()
     inventory = None
     save_json(folder / "summary.json", result)
@@ -142,6 +142,9 @@ def run_job(job, folder, config, env, observer=None):
                 event["msg"] += ": " + event["reason"]
         elif "pass_started" in event:
             event["msg"] = f"Проход {event['pass_started']}: файлов в очереди {event['remaining']}"
+        elif "pass_finished" in event:
+            result["passes_completed"] = event["pass_finished"]
+            event["msg"] = f"Проход {event['pass_finished']} завершён: скачано {event['downloaded']}, осталось в очереди {event['remaining']}"
         log.write(json.dumps(event, ensure_ascii=False) + "\n")
         if state == "downloaded":
             downloaded.write(json.dumps({key: event[key] for key in ("time", "path", "size", "attempt")}, ensure_ascii=False) + "\n")
@@ -160,6 +163,8 @@ def run_job(job, folder, config, env, observer=None):
         root.mkdir(parents=True, exist_ok=True)
         source = remote_source(job["source"], config.get("backend", "webdav"))
         phase("copy", "copy.jsonl")
+        if "retry_passes" in config:
+            emit({"msg": "retry_passes больше не ограничивает повторы: докачиваю остаток до прохода без новых загрузок"})
         identity_parts = [config.get("login", ""), job["source"], str(root.resolve())]
         if config.get("backend", "webdav") == "rest":
             identity_parts.append("rest")  # Не смешиваем индекс WebDAV с ещё не проверенным REST-аккаунтом.
@@ -205,9 +210,12 @@ def run_job(job, folder, config, env, observer=None):
         outcome = asyncio.run(run_with_stop(
             transfers.run_files(entries, source, root, config, env, emit, discover=discover()), config.get("_stop_file")))
         result["manifest_complete"] = outcome["discovery_complete"]
+        result["passes_completed"] = outcome["passes_completed"]
+        result["stop_reason"] = outcome["stop_reason"]
         result["status"] = "ok" if result["manifest_complete"] else "failed"
     except (KeyboardInterrupt, StopRequested):
         result["status"] = "interrupted"
+        result["stop_reason"] = "interrupted"
         raise KeyboardInterrupt from None
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error) as error:
         result["status"] = "failed"

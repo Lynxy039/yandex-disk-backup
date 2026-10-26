@@ -23,6 +23,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
     async def test_edits_and_saves_all_settings_with_private_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
+            path.write_text(json.dumps({"retry_passes": 2}))
             app = YandexApp(path)
             async with app.run_test(size=(120, 45)) as pilot:
                 app.query_one("#login", Input).value = "мой-логин"
@@ -38,7 +39,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.query_one("#password", Input).password)
                 self.assertEqual(saved["idle_timeout"], 8)
                 self.assertEqual(saved["file_timeout"], 20)
-                self.assertEqual(saved["retry_passes"], 2)
+                self.assertNotIn("retry_passes", saved)
                 self.assertNotIn("low_level_retries", saved)
                 if os.name != "nt":
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -334,6 +335,11 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Отложено: 1", str(app.query_one("#stats", Static).render()))
                 self.assertIn("6.5 с", str(app.query_one("#active-files", Static).render()))
                 self.assertIn("512", str(app.query_one("#stats", Static).render()))
+                app.handle_log({"stats": {"pass": 4, "passes": None, "passDownloaded": 1, "processed": 1, "passTotal": 2}})
+                detail = str(app.query_one("#stats", Static).render())
+                self.assertIn("Проход: 4", detail)
+                self.assertIn("новых: 1", detail)
+                self.assertNotIn("None", detail)
                 app.handle_log({"stats": {"discovering": True, "listed": 2, "discovery_idle": 10}})
                 self.assertIn("Обход + скачивание", str(app.query_one("#phase", Static).render()))
                 app.handle_log({"stats": {"discovery_complete": False, "listed": 2}})

@@ -12,6 +12,5 @@
   "transfers": 16,
   "idle_timeout": 8,
   "file_timeout": 60,
-  "retry_passes": 2,
   "listing_timeout": 180
 }

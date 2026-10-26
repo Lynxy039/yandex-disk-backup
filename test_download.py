@@ -79,8 +79,33 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertIn("Нет данных 8 с\tПапка/фото.jpg", (root / "run/failed.txt").read_text())
             failed = json.loads((root / "run/failed.jsonl").read_text())
-            self.assertEqual(failed["attempts"], 2)
+            self.assertEqual(failed["attempts"], 1)
+            self.assertEqual(result["passes_completed"], 1)
+            self.assertEqual(result["stop_reason"], "no_progress")
             self.assertFalse(result["verification_complete"])
+
+    def test_progress_retries_save_pass_results_and_verify_only_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing = [{"Path": f"{n}.jpg", "Size": 3, "IsDir": False} for n in range(1, 5)]
+            async def attempt(source, temporary, item, config, env, active):
+                if item["attempts"] < int(item["path"][0]):
+                    return "500"
+                temporary.write_bytes(b"abc")
+                return None
+            with patch.object(download, "list_source", return_value=records(listing)) as discovery, \
+                 patch("transfers.attempt", side_effect=attempt), \
+                 patch.object(download, "write_reports", wraps=download.write_reports) as verify:
+                result = download.run_job({"source": "/Фото", "destination": str(root / "backup")},
+                    root / "run", {"transfers": 1, "retry_passes": 0}, {})
+            discovery.assert_called_once()
+            verify.assert_called_once()
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["passes_completed"], 4)
+            self.assertEqual(result["stop_reason"], "queue_finished")
+            events = [json.loads(line) for line in (root / "run/copy.jsonl").read_text().splitlines()]
+            self.assertEqual([e["downloaded"] for e in events if "pass_finished" in e], [1, 1, 1, 1])
+            self.assertEqual(json.loads((root / "run/summary.json").read_text())["passes_completed"], 4)
 
     def test_interrupt_saves_pending_file_status(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -100,6 +100,80 @@ class TransferTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((root / "hang.jpg").read_bytes(), b"abc")
             self.assertTrue(any(event.get("state") == "deferred" for event in events))
 
+    async def test_retries_only_shrinking_remainder_while_progress_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries, calls, events, listings = [], [], [], []
+            thresholds = {"a.jpg": 1, "b.jpg": 2, "c.jpg": 3, "d.jpg": 4}
+            async def discover():
+                listings.append("once")
+                for name in thresholds:
+                    yield {"path": name, "size": 3, "status": "pending", "attempts": 0}
+            async def attempt(source, temporary, item, config, env, active):
+                calls.append(item["path"])
+                if item["attempts"] < thresholds[item["path"]]:
+                    return "503"
+                temporary.write_bytes(b"abc")
+                return None
+            with patch.object(transfers, "attempt", side_effect=attempt), \
+                 patch.object(transfers, "safe_path", wraps=transfers.safe_path) as local_check:
+                result = await transfers.run_files(entries, "remote:/", root,
+                    {"transfers": 1, "retry_passes": 2}, {}, events.append, discover=discover())
+            self.assertEqual(calls, ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "b.jpg", "c.jpg", "d.jpg", "c.jpg", "d.jpg", "d.jpg"])
+            self.assertEqual(listings, ["once"])
+            checks = [call.args[1] for call in local_check.call_args_list]
+            self.assertEqual({name: checks.count(name) for name in thresholds}, {name: n + 1 for name, n in thresholds.items()})
+            self.assertEqual([item["status"] for item in entries], ["downloaded"] * 4)
+            self.assertEqual([e["remaining"] for e in events if "pass_started" in e], [0, 3, 2, 1])
+            self.assertEqual(result["passes_completed"], 4)
+            self.assertEqual(result["stop_reason"], "queue_finished")
+
+    async def test_stops_after_first_pass_without_downloads_even_with_present_files(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                entries = [{"path": "blocked.jpg", "size": 3, "status": "pending", "attempts": 0}]
+                if existing:
+                    (root / "ready.jpg").write_bytes(b"abc")
+                    entries.append({"path": "ready.jpg", "size": 3, "status": "pending", "attempts": 0})
+                with patch.object(transfers, "attempt", return_value="500") as attempt:
+                    result = await transfers.run_files(entries, "remote:/", root, {}, {}, lambda _: None)
+                self.assertEqual(attempt.await_count, 1)
+                self.assertEqual(result["stop_reason"], "no_progress")
+                self.assertEqual(result["passes_completed"], 1)
+                self.assertEqual(entries[0]["status"], "failed")
+
+    async def test_stops_on_later_empty_pass_not_on_old_retry_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = [{"path": name, "size": 3, "status": "pending", "attempts": 0} for name in ("ok.jpg", "blocked.jpg")]
+            async def attempt(source, temporary, item, config, env, active):
+                if item["path"] == "blocked.jpg" and item["attempts"] < 3:
+                    return "500"
+                temporary.write_bytes(b"abc")
+                return None
+            with patch.object(transfers, "attempt", side_effect=attempt):
+                result = await transfers.run_files(entries, "remote:/", root, {"transfers": 1}, {}, lambda _: None)
+            self.assertEqual(entries[1]["attempts"], 2)
+            self.assertEqual(entries[1]["status"], "failed")
+            self.assertEqual(result["stop_reason"], "no_progress")
+            self.assertEqual(result["passes_completed"], 2)
+
+    async def test_empty_file_download_counts_as_progress_not_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = [{"path": "empty", "size": 0, "status": "pending", "attempts": 0},
+                       {"path": "later", "size": 3, "status": "pending", "attempts": 0}]
+            async def attempt(source, temporary, item, config, env, active):
+                if item["path"] == "later" and item["attempts"] == 1:
+                    return "503"
+                temporary.write_bytes(b"" if item["size"] == 0 else b"abc")
+                return None
+            with patch.object(transfers, "attempt", side_effect=attempt):
+                result = await transfers.run_files(entries, "remote:/", root, {}, {}, lambda _: None)
+            self.assertEqual([e["status"] for e in entries], ["downloaded", "downloaded"])
+            self.assertEqual(result["passes_completed"], 2)
+
     async def test_stalled_process_is_killed_and_partial_file_is_not_published(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

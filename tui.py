@@ -223,12 +223,12 @@ class YandexApp(App):
                                     yield Label(title)
                                     yield Input(str(self.settings[key]), type="integer", id=key)
                         with Horizontal(classes="options"):
-                            for key, title in (("retry_passes", "Повторных проходов"), ("listing_timeout", "Пауза списка, с")):
+                            for key, title in (("listing_timeout", "Пауза списка, с"),):
                                 with Vertical(classes="option"):
                                     yield Label(title)
                                     yield Input(str(self.settings[key]), type="integer", id=key)
-                        yield Static("Нет новых данных 8 с → следующий файл. Повторы — только в конце очереди.\n"
-                                     "Лимит фото — минимальный общий предел попытки; для больших файлов он увеличивается по размеру.",
+                        yield Static("Нет новых данных 8 с → следующий файл. Повторяем только остаток, пока проход скачивает новые файлы.\n"
+                                     "Проход без новых загрузок → остановка. Лимит фото увеличивается для больших файлов по размеру.",
                                      classes="hint")
                 yield Static(self.load_error or f"Настройки: {self.config_path}", id="form-message", markup=False)
                 with Horizontal(id="form-actions"):
@@ -277,7 +277,7 @@ class YandexApp(App):
     def collect_settings(self):
         # Не оставляем неактивные учётные данные открытым текстом после смены режима.
         config = {key: value for key, value in self.settings.items()
-                  if key not in ("retries", "low_level_retries", "app_password", "app_password_encrypted", "oauth_token", "oauth_token_encrypted")}
+                  if key not in ("retries", "low_level_retries", "retry_passes", "app_password", "app_password_encrypted", "oauth_token", "oauth_token_encrypted")}
         config["backend"] = self.query_one("#backend", Select).value
         credential, encrypted_field = passwords.credential_fields(config)
         config[credential] = self.query_one("#password", Input).value
@@ -509,7 +509,7 @@ class YandexApp(App):
                 detail = (f"Скачано: {stats.get('transfers', 0)}   Уже есть: {stats.get('present', 0)}   "
                           f"Отложено: {stats.get('deferred', 0)}   Не удалось: {stats.get('errors', 0)}\n"
                           f"{size(stats.get('bytes'))}   Скорость: {size(stats.get('speed'))}/с   "
-                          f"Проход: {stats.get('pass', 1)}/{stats.get('passes', 1)} · обработано {progress}/{total}")
+                          f"Проход: {stats.get('pass', 1)} · новых: {stats.get('passDownloaded', 0)} · обработано {progress}/{total}")
             else:
                 total, progress = stats.get("totalChecks", 0), stats.get("checks", 0)
                 detail = f"Проверено файлов: {progress}/{total}"
